@@ -88,75 +88,18 @@ export function run(input) {
         let close = -1;
         let qhit = false;
         let s = pos;
-        while (s + 3 < n) {
-    b = buf[s];
-    if (b === 34) {
-      if (text.charCodeAt(s) === 34) {
-        if (buf[s+1] === 34 && text.charCodeAt(s+1) === 34) {
-          seg = seg === null ? text.slice(segStart, s) + '"' : seg + text.slice(segStart, s) + '"';
-              s += 2; segStart = s; continue;
-        }
-        close = s; qhit = true; break;
-      }
-    } else if (b < 14) {
-      if (b === 10) { if (text.charCodeAt(s) === 10) breaks += 1; }
-      else if (b === 13) { if (text.charCodeAt(s) === 13) { hasCR = true; if (!(buf[s+1] === 10 && text.charCodeAt(s+1) === 10)) breaks += 1; } }
-    }
-    b = buf[s+1];
-    if (b === 34) {
-      if (text.charCodeAt(s+1) === 34) {
-        if (buf[s+1+1] === 34 && text.charCodeAt(s+1+1) === 34) {
-          seg = seg === null ? text.slice(segStart, s+1) + '"' : seg + text.slice(segStart, s+1) + '"';
-              s += 1+2; segStart = s; continue;
-        }
-        close = s+1; qhit = true; break;
-      }
-    } else if (b < 14) {
-      if (b === 10) { if (text.charCodeAt(s+1) === 10) breaks += 1; }
-      else if (b === 13) { if (text.charCodeAt(s+1) === 13) { hasCR = true; if (!(buf[s+1+1] === 10 && text.charCodeAt(s+1+1) === 10)) breaks += 1; } }
-    }
-    b = buf[s+2];
-    if (b === 34) {
-      if (text.charCodeAt(s+2) === 34) {
-        if (buf[s+2+1] === 34 && text.charCodeAt(s+2+1) === 34) {
-          seg = seg === null ? text.slice(segStart, s+2) + '"' : seg + text.slice(segStart, s+2) + '"';
-              s += 2+2; segStart = s; continue;
-        }
-        close = s+2; qhit = true; break;
-      }
-    } else if (b < 14) {
-      if (b === 10) { if (text.charCodeAt(s+2) === 10) breaks += 1; }
-      else if (b === 13) { if (text.charCodeAt(s+2) === 13) { hasCR = true; if (!(buf[s+2+1] === 10 && text.charCodeAt(s+2+1) === 10)) breaks += 1; } }
-    }
-    b = buf[s+3];
-    if (b === 34) {
-      if (text.charCodeAt(s+3) === 34) {
-        if (buf[s+3+1] === 34 && text.charCodeAt(s+3+1) === 34) {
-          seg = seg === null ? text.slice(segStart, s+3) + '"' : seg + text.slice(segStart, s+3) + '"';
-              s += 3+2; segStart = s; continue;
-        }
-        close = s+3; qhit = true; break;
-      }
-    } else if (b < 14) {
-      if (b === 10) { if (text.charCodeAt(s+3) === 10) breaks += 1; }
-      else if (b === 13) { if (text.charCodeAt(s+3) === 13) { hasCR = true; if (!(buf[s+3+1] === 10 && text.charCodeAt(s+3+1) === 10)) breaks += 1; } }
-    }
-          s += 4;
-        }
-        if (!qhit) {
-    while (s < n) {
-      b = buf[s];
-      if (b === 34) {
-        if (text.charCodeAt(s) === 34) {
-          if (buf[s+1] === 34 && text.charCodeAt(s+1) === 34) { seg = seg === null ? text.slice(segStart, s) + '"' : seg + text.slice(segStart, s) + '"'; s += 2; segStart = s; continue; }
-          close = s; qhit = true; break;
-        }
-      } else if (b < 14) {
-        if (b === 10) { if (text.charCodeAt(s) === 10) breaks += 1; }
-        else if (b === 13) { if (text.charCodeAt(s) === 13) { hasCR = true; if (!(buf[s+1] === 10 && text.charCodeAt(s+1) === 10)) breaks += 1; } }
-      }
-      s += 1;
-    }
+        while (s < n) {
+          b = buf[s];
+          if (b === 34) {
+            if (text.charCodeAt(s) === 34) {
+              if (buf[s+1] === 34 && text.charCodeAt(s+1) === 34) { seg = seg === null ? text.slice(segStart, s) + '"' : seg + text.slice(segStart, s) + '"'; s += 2; segStart = s; continue; }
+              close = s; qhit = true; break;
+            }
+          } else if (b < 14) {
+            if (b === 10) { if (text.charCodeAt(s) === 10) breaks += 1; }
+            else if (b === 13) { if (text.charCodeAt(s) === 13) { hasCR = true; if (!(buf[s+1] === 10 && text.charCodeAt(s+1) === 10)) breaks += 1; } }
+          }
+          s += 1;
         }
         if (close === -1) {
           pos = open + 1;
@@ -167,7 +110,7 @@ export function run(input) {
         } else {
           let qval;
           if (seg === null) {
-            qval = text.slice(open + 1, close);
+            qval = close === open + 1 ? '' : text.slice(open + 1, close);
           } else {
             qval = seg + text.slice(segStart, close);
           }
@@ -216,14 +159,14 @@ export function run(input) {
       j += 1;
     }
         }
-        if (j >= n) { value = text.slice(pos, j); ended = END; pos = n; }
-        else if (c === 44) { value = text.slice(pos, j); ended = COMMA; pos = j + 1; }
-        else if (c === 10) { value = text.slice(pos, j); ended = LINE_BREAK; pos = j + 1; line += 1; }
-        else if (buf[j + 1] === 10 && text.charCodeAt(j + 1) === 10) { value = text.slice(pos, j); ended = LINE_BREAK; pos = j + 2; line += 1; }
+        if (j >= n) { value = j === pos ? '' : text.slice(pos, j); ended = END; pos = n; }
+        else if (c === 44) { value = j === pos ? '' : text.slice(pos, j); ended = COMMA; pos = j + 1; }
+        else if (c === 10) { value = j === pos ? '' : text.slice(pos, j); ended = LINE_BREAK; pos = j + 1; line += 1; }
+        else if (buf[j + 1] === 10 && text.charCodeAt(j + 1) === 10) { value = j === pos ? '' : text.slice(pos, j); ended = LINE_BREAK; pos = j + 2; line += 1; }
         else {
           // Stray CR at j: slow scan from j+1, first segment already kept.
           errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-          const r = slowScan(text, n, errors, recordLine, recordRow, null, j + 1, [text.slice(pos, j)], j - pos);
+          const r = slowScan(text, n, errors, recordLine, recordRow, null, j + 1, [j === pos ? '' : text.slice(pos, j)], j - pos);
           value = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
         }
       }
