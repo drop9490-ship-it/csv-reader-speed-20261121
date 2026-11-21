@@ -27,17 +27,24 @@
 //     for the header).
 //
 // Speed: a single-pass scanner. Unquoted fields are scanned for their delimiter
-// one character at a time (a single range check per character) but built with
-// one slice (no per-character string building); quoted fields are found with
+// one character at a time (three equality checks per character) but built with
+// one slice (no per-character concatenation); quoted fields are found with
 // indexOf('"') and the same slice fast path. Slow paths run only where the data
 // forces them: stray CRs inside a field, doubled quotes, and CR/LF inside a
 // quoted field. No allocation per character, no per-field array unless a field
-// is actually broken.
+// is actually broken, and the scan result is a single reused object (no
+// per-field result allocation).
 
 /** How a field ended: at a comma (the record goes on), at a line break or at the end of the text (the record ends). */
 const COMMA = 0;
 const LINE_BREAK = 1;
 const END = 2;
+
+// Reused scan result: scanUnquoted writes its answer here and returns this
+// same object every time, so no object is allocated per field (the caller
+// reads value/ended/added/next/lineBump synchronously before the next scan).
+// Every return sets ALL five fields, so no stale lineBump can leak.
+const SCAN_OUT = { value: '', ended: 0, added: 0, next: 0, lineBump: 0 };
 
 /** csv-reader 1.0.0's answer for one case's input. */
 export function run(input) {
@@ -69,17 +76,17 @@ export function run(input) {
       let j = i;
       while (j < n) {
         const c = text.charCodeAt(j);
-        if (c < 45 && (c === 44 || c === 10 || c === 13)) break;
+        if (c === 44 || c === 10 || c === 13) break;
         j += 1;
       }
       const tail = text.slice(vstart, j);
       added += j - vstart;
       const value = seg === null ? (prefix === null ? tail : prefix + tail) : (prefix === null ? seg.join('') + tail : prefix + seg.join('') + tail);
-      if (j >= n) return { value, ended: END, added, next: n };
+      if (j >= n) { SCAN_OUT.value = value; SCAN_OUT.ended = END; SCAN_OUT.added = added; SCAN_OUT.next = n; SCAN_OUT.lineBump = 0; return SCAN_OUT; }
       const c = text.charCodeAt(j);
-      if (c === 44) return { value, ended: COMMA, added, next: j + 1 };
-      if (c === 10) return { value, ended: LINE_BREAK, added, next: j + 1, lineBump: 1 };
-      if (text.charCodeAt(j + 1) === 10) return { value, ended: LINE_BREAK, added, next: j + 2, lineBump: 1 };
+      if (c === 44) { SCAN_OUT.value = value; SCAN_OUT.ended = COMMA; SCAN_OUT.added = added; SCAN_OUT.next = j + 1; SCAN_OUT.lineBump = 0; return SCAN_OUT; }
+      if (c === 10) { SCAN_OUT.value = value; SCAN_OUT.ended = LINE_BREAK; SCAN_OUT.added = added; SCAN_OUT.next = j + 1; SCAN_OUT.lineBump = 1; return SCAN_OUT; }
+      if (text.charCodeAt(j + 1) === 10) { SCAN_OUT.value = value; SCAN_OUT.ended = LINE_BREAK; SCAN_OUT.added = added; SCAN_OUT.next = j + 2; SCAN_OUT.lineBump = 1; return SCAN_OUT; }
       // A CR not followed by LF is dropped (stray_cr); the field goes on.
       errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
       if (seg === null) seg = [tail];
