@@ -1,3 +1,10 @@
+// v21 (from v20): --no-turbo-inlining + --optimize-for-size (V8 flags via
+// setFlagsFromString) cut TurboFan compile CPU sharply; quoted-field branch
+// split out of parseCase into top-level quotedField; warmup trimmed to the
+// 6 feedback-complete singles only (the 134KB wb span + 30x loops deleted —
+// wb made slowScan hot enough to compile for nothing, ~8% of whole-program);
+// output written per-part with writeSync instead of Buffer.concat (no 12MB
+// copy). solve.js = v11 unchanged. See V21-REPORT.md.
 // v20 (from v19): implementation moved to main.js — see V20-REPORT.md.
 // Node 22 type-strips every .ts file before running it; for this 21KB file
 // that costs ~0.27s of CPU (measured: same file as .mjs loads in 0.05s vs
@@ -54,7 +61,7 @@ import { setFlagsFromString } from 'node:v8';
 // V8's incremental marking off, set before solve.js is imported so all of
 // its work runs under it (the rules: the house baseline runs with
 // --no-incremental-marking, and an entry may tune V8's flags too).
-setFlagsFromString('--no-incremental-marking');
+setFlagsFromString('--no-incremental-marking --no-turbo-inlining --optimize-for-size');
 
 const COMMA = 0;
 const LINE_BREAK = 1;
@@ -228,6 +235,62 @@ function scanQuoted(raw, n, start) {
   Q.pieces = pieces; Q.lits = lits;
 }
 
+const QF = { pos: 0, line: 0, ended: 0, vStr: null, vA: 0, vB: 0, vPieces: null, vLits: null, vSpanBytes: 0 };
+function quotedField(raw, n, pos, line, errParts, recordLine, recordRow) {
+  let vStr = null;
+  let vA = 0;
+  let vB = 0;
+  let vPieces = null;
+  let vLits = null;
+  let vSpanBytes = 0;
+  let ended = 0;
+  // ---- Quoted field (same semantics as v11).
+  const open = pos;
+  const openLine = line;
+  pos += 2;
+  scanQuoted(raw, n, pos);
+  let segStart = Q.segStart;
+  let breaks = Q.breaks;
+  let close = Q.close;
+  let qhit = Q.qhit;
+  let pieces = Q.pieces;
+  let lits = Q.lits;
+  if (close === -1) {
+    pos = open + 2;
+    line = openLine;
+    errParts.push(JSON.stringify({ code: 'unterminated_quote', line: recordLine, row: recordRow }));
+    const r = slowScan(raw, n, errParts, recordLine, recordRow, '"', pos, null, 0);
+    vStr = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
+  } else {
+    if (pieces === null) { vA = open + 2; vB = close; vSpanBytes = close - (open + 2); }
+    else {
+      pieces.push(segStart, close);
+      vPieces = pieces; vLits = lits;
+      vSpanBytes = 0;
+      for (let k = 0; k < vPieces.length; k += 2) vSpanBytes += vPieces[k + 1] - vPieces[k];
+    }
+    line += breaks;
+    pos = close + 2;
+    if (pos >= n) { ended = END; }
+    else {
+      const cb = raw[pos];
+      if (cb === 44) { pos += 1; ended = COMMA; }
+      else if (cb === 92 && raw[pos + 1] === 110) { pos += 2; line += 1; ended = LINE_BREAK; }
+      else if (cb === 92 && raw[pos + 1] === 114 && raw[pos + 2] === 92 && raw[pos + 3] === 110) { pos += 4; line += 1; ended = LINE_BREAK; }
+      else {
+        const qval = vPieces === null ? spanToString(raw, vA, vB) : materializeSpans(raw, vPieces, vLits);
+        const r = slowScan(raw, n, errParts, recordLine, recordRow, qval, pos, null, 0);
+        vStr = r.value; vPieces = null; vLits = null; vSpanBytes = 0;
+        ended = r.ended; pos = r.next; line += r.lineBump;
+        if (r.added > 0) errParts.push(JSON.stringify({ code: 'quote_junk', line: recordLine, row: recordRow }));
+      }
+    }
+  }
+
+  QF.pos = pos; QF.line = line; QF.ended = ended; QF.vStr = vStr;
+  QF.vA = vA; QF.vB = vB; QF.vPieces = vPieces; QF.vLits = vLits; QF.vSpanBytes = vSpanBytes;
+}
+
 function parseCase(raw, s0, e, header) {
   const n = e;
   let ob = Buffer.allocUnsafe(Math.max(1024, (e - s0) + ((e - s0) >> 2)));
@@ -276,50 +339,12 @@ function parseCase(raw, s0, e, header) {
       let vSpanBytes = 0;
       let fQuoted = false;
       if (raw[pos] === 92 && raw[pos + 1] === 34) {
-        // ---- Quoted field (same semantics as v11).
+        // ---- Quoted field (same semantics as v11), split to top level.
         fQuoted = true;
         quoted = true;
-        const open = pos;
-        const openLine = line;
-        pos += 2;
-        scanQuoted(raw, n, pos);
-        let segStart = Q.segStart;
-        let breaks = Q.breaks;
-        let close = Q.close;
-        let qhit = Q.qhit;
-        let pieces = Q.pieces;
-        let lits = Q.lits;
-        if (close === -1) {
-          pos = open + 2;
-          line = openLine;
-          errParts.push(JSON.stringify({ code: 'unterminated_quote', line: recordLine, row: recordRow }));
-          const r = slowScan(raw, n, errParts, recordLine, recordRow, '"', pos, null, 0);
-          vStr = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
-        } else {
-          if (pieces === null) { vA = open + 2; vB = close; vSpanBytes = close - (open + 2); }
-          else {
-            pieces.push(segStart, close);
-            vPieces = pieces; vLits = lits;
-            vSpanBytes = 0;
-            for (let k = 0; k < vPieces.length; k += 2) vSpanBytes += vPieces[k + 1] - vPieces[k];
-          }
-          line += breaks;
-          pos = close + 2;
-          if (pos >= n) { ended = END; }
-          else {
-            const cb = raw[pos];
-            if (cb === 44) { pos += 1; ended = COMMA; }
-            else if (cb === 92 && raw[pos + 1] === 110) { pos += 2; line += 1; ended = LINE_BREAK; }
-            else if (cb === 92 && raw[pos + 1] === 114 && raw[pos + 2] === 92 && raw[pos + 3] === 110) { pos += 4; line += 1; ended = LINE_BREAK; }
-            else {
-              const qval = vPieces === null ? spanToString(raw, vA, vB) : materializeSpans(raw, vPieces, vLits);
-              const r = slowScan(raw, n, errParts, recordLine, recordRow, qval, pos, null, 0);
-              vStr = r.value; vPieces = null; vLits = null; vSpanBytes = 0;
-              ended = r.ended; pos = r.next; line += r.lineBump;
-              if (r.added > 0) errParts.push(JSON.stringify({ code: 'quote_junk', line: recordLine, row: recordRow }));
-            }
-          }
-        }
+        quotedField(raw, n, pos, line, errParts, recordLine, recordRow);
+        pos = QF.pos; line = QF.line; ended = QF.ended; vStr = QF.vStr;
+        vA = QF.vA; vB = QF.vB; vPieces = QF.vPieces; vLits = QF.vLits; vSpanBytes = QF.vSpanBytes;
       } else {
         // ---- FAST: plain unquoted field. 1-lane raw scan + one span copy.
         quoted = false;
@@ -426,20 +451,12 @@ async function transduceAll(raw) {
     const wd = Buffer.from("a,b", 'ascii');
     const wbom = Buffer.from([0xEF, 0xBB, 0xBF, ...Buffer.from("a,b\\n1,2\\n", 'ascii')]);
 
-    const wb = Buffer.from(w.toString('ascii').repeat(500), 'ascii');
     parseCase(w, 0, w.length, true);
     parseCase(w, 0, w.length, false);
     parseCase(wu, 0, wu.length, true);
     parseCase(we, 0, we.length, true);
     parseCase(wd, 0, wd.length, true);
     parseCase(wbom, 0, wbom.length, true);
-    parseCase(wb, 0, wb.length, true);
-    for (let i = 0; i < 30; i++) parseCase(w, 0, w.length, true);
-    for (let i = 0; i < 30; i++) parseCase(w, 0, w.length, false);
-    for (let i = 0; i < 30; i++) parseCase(wu, 0, wu.length, true);
-    for (let i = 0; i < 30; i++) parseCase(we, 0, we.length, true);
-    for (let i = 0; i < 30; i++) parseCase(wd, 0, wd.length, true);
-    for (let i = 0; i < 30; i++) parseCase(wbom, 0, wbom.length, true);
   }
   let p = 0;
   while (p < raw.length && isWs(raw[p])) p++;
@@ -482,7 +499,7 @@ async function transduceAll(raw) {
   while (p < raw.length && isWs(raw[p])) p++;
   if (p < raw.length) throw NEED_FALLBACK;
   parts.push(Buffer.from(']', 'ascii'));
-  return Buffer.concat(parts);
+  return parts;
 }
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
@@ -496,4 +513,10 @@ try {
   if (err === NEED_FALLBACK) outBuf = await fallbackAll(raw);
   else throw err;
 }
-writeFileSync(join(OUTPUT_DIR, 'answers.json'), outBuf);
+{
+  const { openSync, writeSync, closeSync } = await import('node:fs');
+  const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
+  const chunks = Buffer.isBuffer(outBuf) ? [outBuf] : outBuf;
+  for (const part of chunks) writeSync(fd, part);
+  closeSync(fd);
+}
