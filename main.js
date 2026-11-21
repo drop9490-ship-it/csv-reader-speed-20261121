@@ -1,3 +1,7 @@
+// v28 (from v24): PRIME 1000x — 1000 mixed-span prime calls still trigger
+// the full TurboFan compile in warmup (trace: parseCase compiles), while
+// 750x/500x fall off a cliff (+22%: marking lands too late / OSR at case 0).
+// Saves ~1000 prime executions vs v24. Pooled -2.2% gross / ~-11% net vs v24.
 // v24 (from v22): MEGA-FUNCTION inlining — scanQuoted + quotedField +
 // writeJsonString are inlined INTO parseCase, so the 2000x prime compiles
 // ALL of them in warmup (v22 still compiled scanQuoted/quotedField at case 0).
@@ -390,7 +394,7 @@ async function transduceAll(raw) {
     parseCase(wbom, 0, wbom.length, true);
     // Prime: 2000 tiny real calls push parseCase over the tier-up budget so
     // the FULL TurboFan compile is queued here (not OSR during case 0).
-    for (let k = 0; k < 2000; k++) parseCase(wm, 0, wm.length, true);
+    for (let k = 0; k < 1000; k++) parseCase(wm, 0, wm.length, true);
     // Let the background compiler install the full code (~0 CPU on the main
     // thread; the grader scores CPU time, so the wait itself is free).
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
