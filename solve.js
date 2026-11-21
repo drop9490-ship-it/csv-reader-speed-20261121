@@ -26,14 +26,16 @@
 //     CR inside a quoted field counted), row its record's index in rows (null
 //     for the header).
 //
-// Speed: a single-pass scanner. Unquoted fields are scanned for their delimiter
+// Speed (v3): a single-pass scanner. Unquoted fields are scanned for their delimiter
 // one character at a time (three equality checks per character) but built with
 // one slice (no per-character concatenation); quoted fields are found with
 // indexOf('"') and the same slice fast path. Slow paths run only where the data
 // forces them: stray CRs inside a field, doubled quotes, and CR/LF inside a
 // quoted field. No allocation per character, no per-field array unless a field
-// is actually broken, and the scan result is a single reused object (no
-// per-field result allocation).
+// is actually broken. v3 vs v2: the unquoted scan is inlined at its three call
+// sites (no ~700k closure calls per 10 MB set; results go to shared locals
+// scanValue/scanEnded/scanAdded/scanNext/scanLineBump) and doubled quotes in a
+// quoted field accumulate by string concatenation instead of an array + join.
 
 /** How a field ended: at a comma (the record goes on), at a line break or at the end of the text (the record ends). */
 const COMMA = 0;
@@ -67,38 +69,10 @@ export function run(input) {
   // measure). Pushes stray_cr errors as met, in order. Scans for the next
   // delimiter one character at a time but builds the field with a single slice,
   // so no string is ever built up a character at a time.
-  function scanUnquoted(prefix) {
-    let seg = null; // segments when a stray CR was dropped
-    let added = 0;
-    let vstart = pos;
-    let i = pos;
-    while (true) {
-      let j = i;
-      while (j < n) {
-        const c = text.charCodeAt(j);
-        if (c === 44 || c === 10 || c === 13) break;
-        j += 1;
-      }
-      const tail = text.slice(vstart, j);
-      added += j - vstart;
-      const value = seg === null ? (prefix === null ? tail : prefix + tail) : (prefix === null ? seg.join('') + tail : prefix + seg.join('') + tail);
-      if (j >= n) { SCAN_OUT.value = value; SCAN_OUT.ended = END; SCAN_OUT.added = added; SCAN_OUT.next = n; SCAN_OUT.lineBump = 0; return SCAN_OUT; }
-      const c = text.charCodeAt(j);
-      if (c === 44) { SCAN_OUT.value = value; SCAN_OUT.ended = COMMA; SCAN_OUT.added = added; SCAN_OUT.next = j + 1; SCAN_OUT.lineBump = 0; return SCAN_OUT; }
-      if (c === 10) { SCAN_OUT.value = value; SCAN_OUT.ended = LINE_BREAK; SCAN_OUT.added = added; SCAN_OUT.next = j + 1; SCAN_OUT.lineBump = 1; return SCAN_OUT; }
-      if (text.charCodeAt(j + 1) === 10) { SCAN_OUT.value = value; SCAN_OUT.ended = LINE_BREAK; SCAN_OUT.added = added; SCAN_OUT.next = j + 2; SCAN_OUT.lineBump = 1; return SCAN_OUT; }
-      // A CR not followed by LF is dropped (stray_cr); the field goes on.
-      errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-      if (seg === null) seg = [tail];
-      else seg.push(tail);
-      i = j + 1;
-      vstart = j + 1;
-    }
-  }
-
   // The record being read: the line it starts on and the index in rows it takes (null: the header).
   let recordLine = 1;
   let recordRow = null;
+  let scanPrefix = null, scanValue = '', scanEnded = 0, scanAdded = 0, scanNext = 0, scanLineBump = 0;
 
   while (true) {
     // Lines with no characters are no records.
@@ -130,7 +104,7 @@ export function run(input) {
         const openLine = line;
         pos += 1;
         // Find the closing quote; '""' is one literal quote.
-        let seg = null; // string segments when doubled quotes occur
+        let seg = null; // accumulated value when doubled quotes occur (concat, no array)
         let segStart = pos; // start of the current literal run
         let scan = pos;
         let close = -1;
@@ -138,8 +112,7 @@ export function run(input) {
           const q = text.indexOf('"', scan);
           if (q === -1) break;
           if (text.charCodeAt(q + 1) === 34) {
-            if (seg === null) seg = [];
-            seg.push(text.slice(segStart, q), '"');
+            seg = seg === null ? text.slice(segStart, q) + '"' : seg + text.slice(segStart, q) + '"';
             scan = q + 2;
             segStart = q + 2;
             continue;
@@ -153,18 +126,40 @@ export function run(input) {
           pos = open + 1;
           line = openLine;
           errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          const r = scanUnquoted('"');
-          value = r.value;
-          ended = r.ended;
-          pos = r.next;
-          line += r.lineBump || 0;
+{
+    scanPrefix = '"';
+    let seg = null; // segments when a stray CR was dropped
+    let added = 0;
+    let vstart = pos;
+    let i = pos;
+    scanLoop: while (true) {
+      let j = i;
+      while (j < n) {
+        const c = text.charCodeAt(j);
+        if (c === 44 || c === 10 || c === 13) break;
+        j += 1;
+      }
+      const tail = text.slice(vstart, j);
+      added += j - vstart;
+      const value = seg === null ? (scanPrefix === null ? tail : scanPrefix + tail) : (scanPrefix === null ? seg.join('') + tail : scanPrefix + seg.join('') + tail);
+      if (j >= n) { scanValue = value; scanEnded = END; scanAdded = added; scanNext = n; scanLineBump = 0; break scanLoop; }
+      const c = text.charCodeAt(j);
+      if (c === 44) { scanValue = value; scanEnded = COMMA; scanAdded = added; scanNext = j + 1; scanLineBump = 0; break scanLoop; }
+      if (c === 10) { scanValue = value; scanEnded = LINE_BREAK; scanAdded = added; scanNext = j + 1; scanLineBump = 1; break scanLoop; }
+      if (text.charCodeAt(j + 1) === 10) { scanValue = value; scanEnded = LINE_BREAK; scanAdded = added; scanNext = j + 2; scanLineBump = 1; break scanLoop; }
+      // A CR not followed by LF is dropped (stray_cr); the field goes on.
+      errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+      if (seg === null) seg = [tail];
+      else seg.push(tail);
+      i = j + 1;
+      vstart = j + 1;
+    }
+    value = scanValue; ended = scanEnded; pos = scanNext; line += scanLineBump;
+  }
         } else {
           let qval;
           if (seg === null) qval = text.slice(open + 1, close);
-          else {
-            seg.push(text.slice(segStart, close));
-            qval = seg.join('');
-          }
+          else qval = seg + text.slice(segStart, close);
           // Each CRLF or lone CR inside quotes is read as LF; count every
           // line break the field held so the next record starts on its line.
           if (qval.indexOf('\r') !== -1) qval = qval.replace(/\r\n?/g, '\n');
@@ -197,23 +192,73 @@ export function run(input) {
             } else {
               // What follows the closing quote is appended as it stands, up to
               // the next comma or line break.
-              const r = scanUnquoted(qval);
-              value = r.value;
-              ended = r.ended;
-              pos = r.next;
-              line += r.lineBump || 0;
-              if (r.added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
+{
+    scanPrefix = qval;
+    let seg = null; // segments when a stray CR was dropped
+    let added = 0;
+    let vstart = pos;
+    let i = pos;
+    scanLoop: while (true) {
+      let j = i;
+      while (j < n) {
+        const c = text.charCodeAt(j);
+        if (c === 44 || c === 10 || c === 13) break;
+        j += 1;
+      }
+      const tail = text.slice(vstart, j);
+      added += j - vstart;
+      const value = seg === null ? (scanPrefix === null ? tail : scanPrefix + tail) : (scanPrefix === null ? seg.join('') + tail : scanPrefix + seg.join('') + tail);
+      if (j >= n) { scanValue = value; scanEnded = END; scanAdded = added; scanNext = n; scanLineBump = 0; break scanLoop; }
+      const c = text.charCodeAt(j);
+      if (c === 44) { scanValue = value; scanEnded = COMMA; scanAdded = added; scanNext = j + 1; scanLineBump = 0; break scanLoop; }
+      if (c === 10) { scanValue = value; scanEnded = LINE_BREAK; scanAdded = added; scanNext = j + 1; scanLineBump = 1; break scanLoop; }
+      if (text.charCodeAt(j + 1) === 10) { scanValue = value; scanEnded = LINE_BREAK; scanAdded = added; scanNext = j + 2; scanLineBump = 1; break scanLoop; }
+      // A CR not followed by LF is dropped (stray_cr); the field goes on.
+      errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+      if (seg === null) seg = [tail];
+      else seg.push(tail);
+      i = j + 1;
+      vstart = j + 1;
+    }
+    value = scanValue; ended = scanEnded; pos = scanNext; line += scanLineBump;
+              if (scanAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
+  }
             }
           }
         }
       } else {
         // An unquoted field.
         quoted = false;
-        const r = scanUnquoted(null);
-        value = r.value;
-        ended = r.ended;
-        pos = r.next;
-        line += r.lineBump || 0;
+{
+    scanPrefix = null;
+    let seg = null; // segments when a stray CR was dropped
+    let added = 0;
+    let vstart = pos;
+    let i = pos;
+    scanLoop: while (true) {
+      let j = i;
+      while (j < n) {
+        const c = text.charCodeAt(j);
+        if (c === 44 || c === 10 || c === 13) break;
+        j += 1;
+      }
+      const tail = text.slice(vstart, j);
+      added += j - vstart;
+      const value = seg === null ? (scanPrefix === null ? tail : scanPrefix + tail) : (scanPrefix === null ? seg.join('') + tail : scanPrefix + seg.join('') + tail);
+      if (j >= n) { scanValue = value; scanEnded = END; scanAdded = added; scanNext = n; scanLineBump = 0; break scanLoop; }
+      const c = text.charCodeAt(j);
+      if (c === 44) { scanValue = value; scanEnded = COMMA; scanAdded = added; scanNext = j + 1; scanLineBump = 0; break scanLoop; }
+      if (c === 10) { scanValue = value; scanEnded = LINE_BREAK; scanAdded = added; scanNext = j + 1; scanLineBump = 1; break scanLoop; }
+      if (text.charCodeAt(j + 1) === 10) { scanValue = value; scanEnded = LINE_BREAK; scanAdded = added; scanNext = j + 2; scanLineBump = 1; break scanLoop; }
+      // A CR not followed by LF is dropped (stray_cr); the field goes on.
+      errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+      if (seg === null) seg = [tail];
+      else seg.push(tail);
+      i = j + 1;
+      vstart = j + 1;
+    }
+    value = scanValue; ended = scanEnded; pos = scanNext; line += scanLineBump;
+  }
       }
       fields.push(value);
     } while (ended === COMMA);
