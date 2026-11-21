@@ -1,3 +1,8 @@
+// v24 (from v22): MEGA-FUNCTION inlining — scanQuoted + quotedField +
+// writeJsonString are inlined INTO parseCase, so the 2000x prime compiles
+// ALL of them in warmup (v22 still compiled scanQuoted/quotedField at case 0).
+// Prime span is now mixed quoted+unquoted ("a",b / c,"d") so the inlined
+// quoted path is exercised too. Trace: only parseCase + scanUnquoted compile.
 // v22 (from v21): prime + sleep — 2000 tiny real parseCase calls queue the
 // FULL TurboFan compile during warmup, then a 300 ms Atomics.wait lets the
 // background compiler install it before case 0, so case 0 never triggers the
@@ -36,27 +41,6 @@ const SLOW_OUT = { value: '', ended: 0, next: 0, lineBump: 0, added: 0 };
 // and JSON.parse-ing is exact (escapes, UTF-8, lone surrogates included).
 function spanToString(raw, a, b) {
   return JSON.parse('"' + raw.toString('utf8', a, b) + '"');
-}
-
-// JSON-escape a JS string value into the output buffer (slow paths only:
-// unterminated / quote-junk / stray-cr field values and cut long-row
-// fields). Returns the new output length.
-function writeJsonString(ob, ol, v) {
-  let s = '"';
-  for (let i = 0; i < v.length; i++) {
-    const c = v.charCodeAt(i);
-    if (c === 34) s += '\\"';
-    else if (c === 92) s += '\\\\';
-    else if (c === 10) s += '\\n';
-    else if (c === 13) s += '\\r';
-    else if (c === 9) s += '\\t';
-    else if (c === 8) s += '\\b';
-    else if (c === 12) s += '\\f';
-    else if (c < 32) s += '\\u' + c.toString(16).padStart(4, '0');
-    else s += v[i];
-  }
-  s += '"';
-  return ol + ob.write(s, ol, 'utf8');
 }
 
 // Generic slow scan over escaped bytes (rare paths only: unterminated
@@ -152,102 +136,6 @@ function scanUnquoted(raw, n, start) {
   UQ.j = j; UQ.c = c; UQ.hit = hit;
 }
 
-const Q = { close: -1, qhit: false, segStart: 0, breaks: 0, pieces: null, lits: null };
-function scanQuoted(raw, n, start) {
-  let s = start;
-  let segStart = start;
-  let breaks = 0;
-  let close = -1;
-  let qhit = false;
-  let pieces = null;
-  let lits = null;
-  let b = 0;
-  let t = 0;
-  while (s < n) {
-    b = raw[s];
-    if (b === 92) {
-      t = raw[s + 1];
-      if (t === 34) {
-        if (raw[s + 2] === 92 && raw[s + 3] === 34) {
-          if (pieces === null) { pieces = []; lits = []; }
-          pieces.push(segStart, s); lits.push(92, 34);
-          s = s + 4; segStart = s; continue;
-        }
-        close = s; qhit = true; break;
-      }
-      if (t === 110) { breaks += 1; s = s + 2; continue; }
-      if (t === 114) {
-        if (pieces === null) { pieces = []; lits = []; }
-        pieces.push(segStart, s); lits.push(92, 110);
-        breaks += 1;
-        if (raw[s + 2] === 92 && raw[s + 3] === 110) { s = s + 4; } else { s = s + 2; }
-        segStart = s; continue;
-      }
-      if (t === 117) throw NEED_FALLBACK;
-      if (t === 116 || t === 98 || t === 102 || t === 47 || t === 92) { s = s + 2; continue; }
-      throw NEED_FALLBACK;
-    }
-    s += 1;
-  }
-  Q.close = close; Q.qhit = qhit; Q.segStart = segStart; Q.breaks = breaks;
-  Q.pieces = pieces; Q.lits = lits;
-}
-
-const QF = { pos: 0, line: 0, ended: 0, vStr: null, vA: 0, vB: 0, vPieces: null, vLits: null, vSpanBytes: 0 };
-function quotedField(raw, n, pos, line, errParts, recordLine, recordRow) {
-  let vStr = null;
-  let vA = 0;
-  let vB = 0;
-  let vPieces = null;
-  let vLits = null;
-  let vSpanBytes = 0;
-  let ended = 0;
-  // ---- Quoted field (same semantics as v11).
-  const open = pos;
-  const openLine = line;
-  pos += 2;
-  scanQuoted(raw, n, pos);
-  let segStart = Q.segStart;
-  let breaks = Q.breaks;
-  let close = Q.close;
-  let qhit = Q.qhit;
-  let pieces = Q.pieces;
-  let lits = Q.lits;
-  if (close === -1) {
-    pos = open + 2;
-    line = openLine;
-    errParts.push(JSON.stringify({ code: 'unterminated_quote', line: recordLine, row: recordRow }));
-    const r = slowScan(raw, n, errParts, recordLine, recordRow, '"', pos, null, 0);
-    vStr = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
-  } else {
-    if (pieces === null) { vA = open + 2; vB = close; vSpanBytes = close - (open + 2); }
-    else {
-      pieces.push(segStart, close);
-      vPieces = pieces; vLits = lits;
-      vSpanBytes = 0;
-      for (let k = 0; k < vPieces.length; k += 2) vSpanBytes += vPieces[k + 1] - vPieces[k];
-    }
-    line += breaks;
-    pos = close + 2;
-    if (pos >= n) { ended = END; }
-    else {
-      const cb = raw[pos];
-      if (cb === 44) { pos += 1; ended = COMMA; }
-      else if (cb === 92 && raw[pos + 1] === 110) { pos += 2; line += 1; ended = LINE_BREAK; }
-      else if (cb === 92 && raw[pos + 1] === 114 && raw[pos + 2] === 92 && raw[pos + 3] === 110) { pos += 4; line += 1; ended = LINE_BREAK; }
-      else {
-        const qval = vPieces === null ? spanToString(raw, vA, vB) : materializeSpans(raw, vPieces, vLits);
-        const r = slowScan(raw, n, errParts, recordLine, recordRow, qval, pos, null, 0);
-        vStr = r.value; vPieces = null; vLits = null; vSpanBytes = 0;
-        ended = r.ended; pos = r.next; line += r.lineBump;
-        if (r.added > 0) errParts.push(JSON.stringify({ code: 'quote_junk', line: recordLine, row: recordRow }));
-      }
-    }
-  }
-
-  QF.pos = pos; QF.line = line; QF.ended = ended; QF.vStr = vStr;
-  QF.vA = vA; QF.vB = vB; QF.vPieces = vPieces; QF.vLits = vLits; QF.vSpanBytes = vSpanBytes;
-}
 
 function parseCase(raw, s0, e, header) {
   const n = e;
@@ -260,8 +148,6 @@ function parseCase(raw, s0, e, header) {
   let width = -1;
   let rowsEmitted = 0;
   let phase = 0; // 0 = columns (header only), 1 = rows
-  let b = 0;
-  let t = 0;
   if (header) { ol += ob.write('{"columns":[', ol, 'ascii'); }
   else { ol += ob.write('{"columns":null,"rows":[', ol, 'ascii'); phase = 1; }
 
@@ -297,12 +183,82 @@ function parseCase(raw, s0, e, header) {
       let vSpanBytes = 0;
       let fQuoted = false;
       if (raw[pos] === 92 && raw[pos + 1] === 34) {
-        // ---- Quoted field (same semantics as v11), split to top level.
+        // ---- Quoted field, INLINED (v24 mega-function: no call, so the
+        // 2000x prime compiles this whole path into parseCase itself).
         fQuoted = true;
         quoted = true;
-        quotedField(raw, n, pos, line, errParts, recordLine, recordRow);
-        pos = QF.pos; line = QF.line; ended = QF.ended; vStr = QF.vStr;
-        vA = QF.vA; vB = QF.vB; vPieces = QF.vPieces; vLits = QF.vLits; vSpanBytes = QF.vSpanBytes;
+  // ---- Quoted field (same semantics as v11).
+  const open = pos;
+  const openLine = line;
+  pos += 2;
+  // Inlined scanQuoted (v24 mega-function): scan from pos.
+  let qs = pos;
+  let segStart = pos;
+  let breaks = 0;
+  let close = -1;
+  let qhit = false;
+  let pieces = null;
+  let lits = null;
+  let qb = 0;
+  let qt = 0;
+  while (qs < n) {
+    qb = raw[qs];
+    if (qb === 92) {
+      qt = raw[qs + 1];
+      if (qt === 34) {
+        if (raw[qs + 2] === 92 && raw[qs + 3] === 34) {
+          if (pieces === null) { pieces = []; lits = []; }
+          pieces.push(segStart, qs); lits.push(92, 34);
+          qs = qs + 4; segStart = qs; continue;
+        }
+        close = qs; qhit = true; break;
+      }
+      if (qt === 110) { breaks += 1; qs = qs + 2; continue; }
+      if (qt === 114) {
+        if (pieces === null) { pieces = []; lits = []; }
+        pieces.push(segStart, qs); lits.push(92, 110);
+        breaks += 1;
+        if (raw[qs + 2] === 92 && raw[qs + 3] === 110) { qs = qs + 4; } else { qs = qs + 2; }
+        segStart = qs; continue;
+      }
+      if (qt === 117) throw NEED_FALLBACK;
+      if (qt === 116 || qt === 98 || qt === 102 || qt === 47 || qt === 92) { qs = qs + 2; continue; }
+      throw NEED_FALLBACK;
+    }
+    qs += 1;
+  }
+  if (close === -1) {
+    pos = open + 2;
+    line = openLine;
+    errParts.push(JSON.stringify({ code: 'unterminated_quote', line: recordLine, row: recordRow }));
+    const r = slowScan(raw, n, errParts, recordLine, recordRow, '"', pos, null, 0);
+    vStr = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
+  } else {
+    if (pieces === null) { vA = open + 2; vB = close; vSpanBytes = close - (open + 2); }
+    else {
+      pieces.push(segStart, close);
+      vPieces = pieces; vLits = lits;
+      vSpanBytes = 0;
+      for (let k = 0; k < vPieces.length; k += 2) vSpanBytes += vPieces[k + 1] - vPieces[k];
+    }
+    line += breaks;
+    pos = close + 2;
+    if (pos >= n) { ended = END; }
+    else {
+      const cb = raw[pos];
+      if (cb === 44) { pos += 1; ended = COMMA; }
+      else if (cb === 92 && raw[pos + 1] === 110) { pos += 2; line += 1; ended = LINE_BREAK; }
+      else if (cb === 92 && raw[pos + 1] === 114 && raw[pos + 2] === 92 && raw[pos + 3] === 110) { pos += 4; line += 1; ended = LINE_BREAK; }
+      else {
+        const qval = vPieces === null ? spanToString(raw, vA, vB) : materializeSpans(raw, vPieces, vLits);
+        const r = slowScan(raw, n, errParts, recordLine, recordRow, qval, pos, null, 0);
+        vStr = r.value; vPieces = null; vLits = null; vSpanBytes = 0;
+        ended = r.ended; pos = r.next; line += r.lineBump;
+        if (r.added > 0) errParts.push(JSON.stringify({ code: 'quote_junk', line: recordLine, row: recordRow }));
+      }
+    }
+  }
+
       } else {
         // ---- FAST: plain unquoted field. 1-lane raw scan + one span copy.
         quoted = false;
@@ -331,7 +287,23 @@ function parseCase(raw, s0, e, header) {
         const need = 1 + 2 + vSpanBytes + (vLits === null ? 0 : vLits.length) + (vStr !== null ? vStr.length * 6 + 16 : 0);
         if (ol + need > ob.length) ob = growBuf(ob, ol, ol + need);
         if (fi > 0) ob[ol++] = 44;
-        if (vStr !== null) { ol = writeJsonString(ob, ol, vStr); }
+        if (vStr !== null) {
+          let s = '"';
+          for (let i = 0; i < vStr.length; i++) {
+            const c = vStr.charCodeAt(i);
+            if (c === 34) s += '\\"';
+            else if (c === 92) s += '\\\\';
+            else if (c === 10) s += '\\n';
+            else if (c === 13) s += '\\r';
+            else if (c === 9) s += '\\t';
+            else if (c === 8) s += '\\b';
+            else if (c === 12) s += '\\f';
+            else if (c < 32) s += '\\u' + c.toString(16).padStart(4, '0');
+            else s += vStr[i];
+          }
+          s += '"';
+          ol += ob.write(s, ol, 'utf8');
+        }
         else if (vPieces === null) {
           ob[ol++] = 34;
           if (vB > vA) { raw.copy(ob, ol, vA, vB); ol += vB - vA; }
@@ -407,6 +379,7 @@ async function transduceAll(raw) {
     const wu = Buffer.from("x,\\\"a\\rb\\r\\nc,d\\ne,f\\n", 'ascii');
     const we = Buffer.from("a,\\\"bc", 'ascii');
     const wd = Buffer.from("a,b", 'ascii');
+    const wm = Buffer.from("\"a\",b\nc,\"d\"\n", 'ascii');
     const wbom = Buffer.from([0xEF, 0xBB, 0xBF, ...Buffer.from("a,b\\n1,2\\n", 'ascii')]);
 
     parseCase(w, 0, w.length, true);
@@ -417,7 +390,7 @@ async function transduceAll(raw) {
     parseCase(wbom, 0, wbom.length, true);
     // Prime: 2000 tiny real calls push parseCase over the tier-up budget so
     // the FULL TurboFan compile is queued here (not OSR during case 0).
-    for (let k = 0; k < 2000; k++) parseCase(wd, 0, wd.length, true);
+    for (let k = 0; k < 2000; k++) parseCase(wm, 0, wm.length, true);
     // Let the background compiler install the full code (~0 CPU on the main
     // thread; the grader scores CPU time, so the wait itself is free).
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
