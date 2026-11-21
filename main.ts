@@ -1,9 +1,3 @@
-// v17 (from v16): scalar field spans — parseCase no longer allocates a
-// [start,end] array + [] lits array per field (709.905 fields on the practice
-// set); single-span fields are carried as scalars vA/vB and emitted with one
-// raw.copy. CPU-profile GC share fell 12.5% -> 4.5%. solve.js unchanged (v11).
-// Whole-program gain vs v16 is small (~2%, below the 10% target — see
-// V17-REPORT.md); exactness 100%.
 // csv-reader-speed v16 — byte-level JSON-to-JSON CSV transducer.
 //
 // Architecture (fundamentally different from v5–v15, which all optimized
@@ -411,8 +405,22 @@ async function transduceAll(raw) {
   // interpreted in a fresh process. 100x ~= 500x; a bigger warm-up span costs
   // more than it saves.
   {
-    const w = Buffer.from('a,\"b\"\"c\"\n1,2\n', 'ascii');
+    const w = Buffer.from("h1,h2,h3,h4\\r\\n\\\"a\\nb\\\",\\\"c\\rd\\\",\\\"e\\r\\nf\\\",\\\"g\\\"\\\"h\\\"\\r\\n\\\"i\\\"junk,\\\"j\\\"\\\"k\\\"junk,plain,\\n1,2,3,4,5,6\\n1,2,3,4,\\\"m\\\"\\\"n\\\",6\\n1,2,3,4,\\\"x\\\"junk,6\\n\\\"only\\\"\\n\\\"a\\nb\\rc\\td\\\\e\\bf\\fg\\\"junk,2,3,4\\n\\\"q\\\"junk\\nshort\\n\\n\\r\\n\\rX\\\\\\\"Y,2,3,4\\n\\\"\\\",x,y,z\\n\\\"p\\tq\\\\r\\\",a\\\\\\\"b,c,d\\n", 'ascii');
+    const wu = Buffer.from("x,\\\"a\\rb\\r\\nc,d\\ne,f\\n", 'ascii');
+    const we = Buffer.from("a,\\\"bc", 'ascii');
+    const wd = Buffer.from("a,b", 'ascii');
+    const wb = Buffer.from(w.toString('ascii').repeat(500), 'ascii');
+    parseCase(w, 0, w.length, true);
+    parseCase(w, 0, w.length, false);
+    parseCase(wu, 0, wu.length, true);
+    parseCase(we, 0, we.length, true);
+    parseCase(wd, 0, wd.length, true);
+    parseCase(wb, 0, wb.length, true);
     for (let i = 0; i < 100; i++) parseCase(w, 0, w.length, true);
+    for (let i = 0; i < 100; i++) parseCase(w, 0, w.length, false);
+    for (let i = 0; i < 100; i++) parseCase(wu, 0, wu.length, true);
+    for (let i = 0; i < 100; i++) parseCase(we, 0, we.length, true);
+    for (let i = 0; i < 100; i++) parseCase(wd, 0, wd.length, true);
   }
   let p = 0;
   while (p < raw.length && isWs(raw[p])) p++;
