@@ -1,3 +1,10 @@
+// v18 (from v17): feedback-complete warmup — the warmup spans now execute
+// every TurboFan eager-deopt site before the first compile (blank lines,
+// lone CR, quoted LF/CR/CRLF, quote junk, unterminated, stray CR, short/long
+// rows incl. multi-span and vStr cut fields, header=false), front-loaded
+// before the repetition loops. parseCase TurboFan compiles 7 -> 4, bailouts
+// 8 -> 2; whole-program rig v18/v17 ~0.844 pooled (-15.6%). solve.js
+// unchanged (v11). See V18-REPORT.md.
 // csv-reader-speed v16 — byte-level JSON-to-JSON CSV transducer.
 //
 // Architecture (fundamentally different from v5–v15, which all optimized
