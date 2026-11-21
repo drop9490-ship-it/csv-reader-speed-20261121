@@ -1,3 +1,9 @@
+// v17 (from v16): scalar field spans — parseCase no longer allocates a
+// [start,end] array + [] lits array per field (709.905 fields on the practice
+// set); single-span fields are carried as scalars vA/vB and emitted with one
+// raw.copy. CPU-profile GC share fell 12.5% -> 4.5%. solve.js unchanged (v11).
+// Whole-program gain vs v16 is small (~2%, below the 10% target — see
+// V17-REPORT.md); exactness 100%.
 // csv-reader-speed v16 — byte-level JSON-to-JSON CSV transducer.
 //
 // Architecture (fundamentally different from v5–v15, which all optimized
@@ -254,7 +260,9 @@ function parseCase(raw, s0, e, header) {
     }
     do {
       let vStr = null;
-      let vSpans = null;
+      let vA = 0;
+      let vB = 0;
+      let vPieces = null;
       let vLits = null;
       let vSpanBytes = 0;
       let fQuoted = false;
@@ -279,12 +287,12 @@ function parseCase(raw, s0, e, header) {
           const r = slowScan(raw, n, errParts, recordLine, recordRow, '"', pos, null, 0);
           vStr = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
         } else {
-          if (pieces === null) { vSpans = [open + 2, close]; vLits = []; vSpanBytes = close - (open + 2); }
+          if (pieces === null) { vA = open + 2; vB = close; vSpanBytes = close - (open + 2); }
           else {
             pieces.push(segStart, close);
-            vSpans = pieces; vLits = lits;
+            vPieces = pieces; vLits = lits;
             vSpanBytes = 0;
-            for (let k = 0; k < vSpans.length; k += 2) vSpanBytes += vSpans[k + 1] - vSpans[k];
+            for (let k = 0; k < vPieces.length; k += 2) vSpanBytes += vPieces[k + 1] - vPieces[k];
           }
           line += breaks;
           pos = close + 2;
@@ -295,9 +303,9 @@ function parseCase(raw, s0, e, header) {
             else if (cb === 92 && raw[pos + 1] === 110) { pos += 2; line += 1; ended = LINE_BREAK; }
             else if (cb === 92 && raw[pos + 1] === 114 && raw[pos + 2] === 92 && raw[pos + 3] === 110) { pos += 4; line += 1; ended = LINE_BREAK; }
             else {
-              const qval = materializeSpans(raw, vSpans, vLits);
+              const qval = vPieces === null ? spanToString(raw, vA, vB) : materializeSpans(raw, vPieces, vLits);
               const r = slowScan(raw, n, errParts, recordLine, recordRow, qval, pos, null, 0);
-              vStr = r.value; vSpans = null; vLits = null; vSpanBytes = 0;
+              vStr = r.value; vPieces = null; vLits = null; vSpanBytes = 0;
               ended = r.ended; pos = r.next; line += r.lineBump;
               if (r.added > 0) errParts.push(JSON.stringify({ code: 'quote_junk', line: recordLine, row: recordRow }));
             }
@@ -310,10 +318,10 @@ function parseCase(raw, s0, e, header) {
         let j = UQ.j;
         let c = UQ.c;
         let hit = UQ.hit;
-        if (j >= n) { vSpans = [pos, j]; vLits = []; vSpanBytes = j - pos; ended = END; pos = n; }
-        else if (c === 44) { vSpans = [pos, j]; vLits = []; vSpanBytes = j - pos; ended = COMMA; pos = j + 1; }
-        else if (c === 10) { vSpans = [pos, j]; vLits = []; vSpanBytes = j - pos; ended = LINE_BREAK; pos = j + 2; line += 1; }
-        else if (raw[j + 2] === 92 && raw[j + 3] === 110) { vSpans = [pos, j]; vLits = []; vSpanBytes = j - pos; ended = LINE_BREAK; pos = j + 4; line += 1; }
+        if (j >= n) { vA = pos; vB = j; vSpanBytes = j - pos; ended = END; pos = n; }
+        else if (c === 44) { vA = pos; vB = j; vSpanBytes = j - pos; ended = COMMA; pos = j + 1; }
+        else if (c === 10) { vA = pos; vB = j; vSpanBytes = j - pos; ended = LINE_BREAK; pos = j + 2; line += 1; }
+        else if (raw[j + 2] === 92 && raw[j + 3] === 110) { vA = pos; vB = j; vSpanBytes = j - pos; ended = LINE_BREAK; pos = j + 4; line += 1; }
         else {
           // Stray CR at j: slow scan from j+2, first segment already kept.
           errParts.push(JSON.stringify({ code: 'stray_cr', line: recordLine, row: recordRow }));
@@ -326,19 +334,23 @@ function parseCase(raw, s0, e, header) {
       const willCut = (phase === 1 && width > 0 && fi >= width);
       if (willCut) {
         if (extraArr === null) extraArr = [];
-        extraArr.push(vStr !== null ? vStr : materializeSpans(raw, vSpans, vLits));
+        extraArr.push(vStr !== null ? vStr : (vPieces === null ? spanToString(raw, vA, vB) : materializeSpans(raw, vPieces, vLits)));
       } else {
         const need = 1 + 2 + vSpanBytes + (vLits === null ? 0 : vLits.length) + (vStr !== null ? vStr.length * 6 + 16 : 0);
         if (ol + need > ob.length) ob = growBuf(ob, ol, ol + need);
         if (fi > 0) ob[ol++] = 44;
         if (vStr !== null) { ol = writeJsonString(ob, ol, vStr); }
-        else {
+        else if (vPieces === null) {
           ob[ol++] = 34;
-          for (let k = 0; k < vSpans.length; k += 2) {
-            const a = vSpans[k];
-            const b2 = vSpans[k + 1];
+          if (vB > vA) { raw.copy(ob, ol, vA, vB); ol += vB - vA; }
+          ob[ol++] = 34;
+        } else {
+          ob[ol++] = 34;
+          for (let k = 0; k < vPieces.length; k += 2) {
+            const a = vPieces[k];
+            const b2 = vPieces[k + 1];
             if (b2 > a) { raw.copy(ob, ol, a, b2); ol += b2 - a; }
-            if (k + 2 < vSpans.length) { ob[ol++] = vLits[k]; ob[ol++] = vLits[k + 1]; }
+            if (k + 2 < vPieces.length) { ob[ol++] = vLits[k]; ob[ol++] = vLits[k + 1]; }
           }
           ob[ol++] = 34;
         }
