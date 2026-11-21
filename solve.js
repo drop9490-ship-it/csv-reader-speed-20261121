@@ -1,93 +1,50 @@
-// Fast csv-reader 1.0.0-compatible CSV reader.
-//
-// Semantics: exactly csv-reader 1.0.0 (make.fun's own reader, derived from
-// d3-dsv 3.0.2's parseRows and papaparse 5.7.1's errors idea). For every input
-// {text, header} run() returns the same {columns, rows, errors} the reference
-// returns, code unit for code unit:
-//
-//   - a U+FEFF at the very start of the text is dropped;
-//   - a record ends at LF or CRLF, and a line left with no characters is no record;
-//   - outside a quoted field a CR not followed by LF is dropped (stray_cr);
-//   - a field that opens with a quote runs to the next quote that is not doubled,
-//     "" inside it is one quote, and each CRLF or lone CR inside it is read as LF;
-//     what follows its closing quote, up to the next comma or line break, is
-//     appended as it stands (quote_junk, when the field ends); a quote that never
-//     closes is a literal character, and the text after it is read again as
-//     unquoted (unterminated_quote);
-//   - a quote inside an unquoted field is a literal character; fields stay
-//     strings, never trimmed or converted;
-//   - columns is the first record when header is true, else null; rows holds the
-//     records after it (every record when header is false), each padded with ""
-//     (short_row, with fields: its field count) or cut (long_row, with extra: the
-//     cut fields) to the first record's width;
-//   - each error is {code, line, row}, in the order met, a field's quote_junk
-//     when the field ends and a record's short_row or long_row when the record
-//     ends: line the 1-based line its record starts on (every LF, CRLF and lone
-//     CR inside a quoted field counted), row its record's index in rows (null
-//     for the header).
-//
-// Speed: a single-pass scanner. Unquoted fields are scanned for their delimiter
-// one character at a time (three equality checks per character) but built with
-// one slice (no per-character concatenation); quoted fields are found with
-// indexOf('"') and the same slice fast path. Slow paths run only where the data
-// forces them: stray CRs inside a field, doubled quotes, and CR/LF inside a
-// quoted field. No allocation per character, no per-field array unless a field
-// is actually broken, and the scan result is a single reused object (no
-// per-field result allocation).
-
-/** How a field ended: at a comma (the record goes on), at a line break or at the end of the text (the record ends). */
+// S2a: v7 skeleton, scans over a latin1 Buffer (1 byte/char, byte index ==
+// char index) instead of utf16le u32. 4 lanes/word, no parity handling, no
+// per-word shift. Delimiter hits verified with charCodeAt (non-ASCII chars
+// whose low byte equals a delimiter byte are false hits).
 const COMMA = 0;
 const LINE_BREAK = 1;
 const END = 2;
 
-// Reused scan result: scanUnquoted writes its answer here and returns this
-// same object every time, so no object is allocated per field (the caller
-// reads value/ended/added/next/lineBump synchronously before the next scan).
-// Every return sets ALL five fields, so no stale lineBump can leak.
-const SCAN_OUT = { value: '', ended: 0, added: 0, next: 0, lineBump: 0 };
+const SLOW_OUT = { value: '', ended: 0, next: 0, lineBump: 0, added: 0 };
 
-/** csv-reader 1.0.0's answer for one case's input. */
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
   const n = text.length;
+  const buf = Buffer.from(text, 'latin1');
   const errors = [];
   const rows = [];
   let columns = null;
   let width = -1;
 
-  let pos = 0; // the next character to read
-  let line = 1; // the line that character is on
+  let pos = 0;
+  let line = 1;
   if (text.charCodeAt(0) === 0xfeff) pos = 1;
 
-  // Reads an unquoted field starting at pos, appending to `prefix` (null for a
-  // plain field, the quoted value for the junk after a closing quote, '"' for
-  // the re-read after a quote that never closes). Returns {value, ended, added}
-  // where `added` counts the characters this scan kept (the junk detector's
-  // measure). Pushes stray_cr errors as met, in order. Scans for the next
-  // delimiter one character at a time but builds the field with a single slice,
-  // so no string is ever built up a character at a time.
-  function scanUnquoted(prefix) {
-    let seg = null; // segments when a stray CR was dropped
-    let added = 0;
-    let vstart = pos;
-    let i = pos;
+  let recordLine = 1;
+  let recordRow = null;
+  let b = 0;
+
+  // Generic scan (rare paths only). Same as v7.
+  function slowScan(prefix, start, seg, added) {
+    let vstart = start;
+    let i = start;
     while (true) {
       let j = i;
+      let c = 0;
       while (j < n) {
-        const c = text.charCodeAt(j);
+        c = text.charCodeAt(j);
         if (c === 44 || c === 10 || c === 13) break;
         j += 1;
       }
       const tail = text.slice(vstart, j);
       added += j - vstart;
-      const value = seg === null ? (prefix === null ? tail : prefix + tail) : (prefix === null ? seg.join('') + tail : prefix + seg.join('') + tail);
-      if (j >= n) { SCAN_OUT.value = value; SCAN_OUT.ended = END; SCAN_OUT.added = added; SCAN_OUT.next = n; SCAN_OUT.lineBump = 0; return SCAN_OUT; }
-      const c = text.charCodeAt(j);
-      if (c === 44) { SCAN_OUT.value = value; SCAN_OUT.ended = COMMA; SCAN_OUT.added = added; SCAN_OUT.next = j + 1; SCAN_OUT.lineBump = 0; return SCAN_OUT; }
-      if (c === 10) { SCAN_OUT.value = value; SCAN_OUT.ended = LINE_BREAK; SCAN_OUT.added = added; SCAN_OUT.next = j + 1; SCAN_OUT.lineBump = 1; return SCAN_OUT; }
-      if (text.charCodeAt(j + 1) === 10) { SCAN_OUT.value = value; SCAN_OUT.ended = LINE_BREAK; SCAN_OUT.added = added; SCAN_OUT.next = j + 2; SCAN_OUT.lineBump = 1; return SCAN_OUT; }
-      // A CR not followed by LF is dropped (stray_cr); the field goes on.
+      const v = seg === null ? (prefix === null ? tail : prefix + tail) : (prefix === null ? seg.join('') + tail : prefix + seg.join('') + tail);
+      if (j >= n) { SLOW_OUT.value = v; SLOW_OUT.ended = END; SLOW_OUT.next = n; SLOW_OUT.lineBump = 0; SLOW_OUT.added = added; return SLOW_OUT; }
+      if (c === 44) { SLOW_OUT.value = v; SLOW_OUT.ended = COMMA; SLOW_OUT.next = j + 1; SLOW_OUT.lineBump = 0; SLOW_OUT.added = added; return SLOW_OUT; }
+      if (c === 10) { SLOW_OUT.value = v; SLOW_OUT.ended = LINE_BREAK; SLOW_OUT.next = j + 1; SLOW_OUT.lineBump = 1; SLOW_OUT.added = added; return SLOW_OUT; }
+      if (text.charCodeAt(j + 1) === 10) { SLOW_OUT.value = v; SLOW_OUT.ended = LINE_BREAK; SLOW_OUT.next = j + 2; SLOW_OUT.lineBump = 1; SLOW_OUT.added = added; return SLOW_OUT; }
       errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
       if (seg === null) seg = [tail];
       else seg.push(tail);
@@ -96,139 +53,191 @@ export function run(input) {
     }
   }
 
-  // The record being read: the line it starts on and the index in rows it takes (null: the header).
-  let recordLine = 1;
-  let recordRow = null;
-
   while (true) {
-    // Lines with no characters are no records.
     while (pos < n) {
-      const c = text.charCodeAt(pos);
-      if (c === 10) {
-        pos += 1;
-        line += 1;
-      } else if (c === 13 && text.charCodeAt(pos + 1) === 10) {
-        pos += 2;
-        line += 1;
-      } else {
-        break;
+      const bb = buf[pos];
+      if (bb === 10) { if (text.charCodeAt(pos) !== 10) break; pos += 1; line += 1; }
+      else if (bb === 13) {
+        if (text.charCodeAt(pos) !== 13) break;
+        if (buf[pos + 1] === 10 && text.charCodeAt(pos + 1) === 10) { pos += 2; line += 1; }
+        else break;
       }
+      else break;
     }
     if (pos >= n) break;
 
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
-    const fields = [];
+    const fields = width > 0 ? new Array(width) : [];
+    let fi = 0;
     let ended;
     let quoted = false;
     do {
       let value;
-      if (text.charCodeAt(pos) === 34) {
-        // A field that opens with a quote.
+      if (buf[pos] === 34 && text.charCodeAt(pos) === 34) {
+        // ---- Quoted field (same semantics as v7).
         quoted = true;
         const open = pos;
         const openLine = line;
         pos += 1;
-        // Find the closing quote; '""' is one literal quote.
-        let seg = null; // string segments when doubled quotes occur
-        let segStart = pos; // start of the current literal run
-        let scan = pos;
+        let seg = null;
+        let segStart = pos;
+        let breaks = 0;
+        let hasCR = false;
         let close = -1;
-        while (true) {
-          const q = text.indexOf('"', scan);
-          if (q === -1) break;
-          if (text.charCodeAt(q + 1) === 34) {
-            if (seg === null) seg = [];
-            seg.push(text.slice(segStart, q), '"');
-            scan = q + 2;
-            segStart = q + 2;
-            continue;
-          }
-          close = q;
-          break;
+        let qhit = false;
+        let s = pos;
+        while (s + 3 < n) {
+    b = buf[s];
+    if (b === 34) {
+      if (text.charCodeAt(s) === 34) {
+        if (buf[s+1] === 34 && text.charCodeAt(s+1) === 34) {
+          seg = seg === null ? text.slice(segStart, s) + '"' : seg + text.slice(segStart, s) + '"';
+              s += 2; segStart = s; continue;
+        }
+        close = s; qhit = true; break;
+      }
+    } else if (b < 14) {
+      if (b === 10) { if (text.charCodeAt(s) === 10) breaks += 1; }
+      else if (b === 13) { if (text.charCodeAt(s) === 13) { hasCR = true; if (!(buf[s+1] === 10 && text.charCodeAt(s+1) === 10)) breaks += 1; } }
+    }
+    b = buf[s+1];
+    if (b === 34) {
+      if (text.charCodeAt(s+1) === 34) {
+        if (buf[s+1+1] === 34 && text.charCodeAt(s+1+1) === 34) {
+          seg = seg === null ? text.slice(segStart, s+1) + '"' : seg + text.slice(segStart, s+1) + '"';
+              s += 1+2; segStart = s; continue;
+        }
+        close = s+1; qhit = true; break;
+      }
+    } else if (b < 14) {
+      if (b === 10) { if (text.charCodeAt(s+1) === 10) breaks += 1; }
+      else if (b === 13) { if (text.charCodeAt(s+1) === 13) { hasCR = true; if (!(buf[s+1+1] === 10 && text.charCodeAt(s+1+1) === 10)) breaks += 1; } }
+    }
+    b = buf[s+2];
+    if (b === 34) {
+      if (text.charCodeAt(s+2) === 34) {
+        if (buf[s+2+1] === 34 && text.charCodeAt(s+2+1) === 34) {
+          seg = seg === null ? text.slice(segStart, s+2) + '"' : seg + text.slice(segStart, s+2) + '"';
+              s += 2+2; segStart = s; continue;
+        }
+        close = s+2; qhit = true; break;
+      }
+    } else if (b < 14) {
+      if (b === 10) { if (text.charCodeAt(s+2) === 10) breaks += 1; }
+      else if (b === 13) { if (text.charCodeAt(s+2) === 13) { hasCR = true; if (!(buf[s+2+1] === 10 && text.charCodeAt(s+2+1) === 10)) breaks += 1; } }
+    }
+    b = buf[s+3];
+    if (b === 34) {
+      if (text.charCodeAt(s+3) === 34) {
+        if (buf[s+3+1] === 34 && text.charCodeAt(s+3+1) === 34) {
+          seg = seg === null ? text.slice(segStart, s+3) + '"' : seg + text.slice(segStart, s+3) + '"';
+              s += 3+2; segStart = s; continue;
+        }
+        close = s+3; qhit = true; break;
+      }
+    } else if (b < 14) {
+      if (b === 10) { if (text.charCodeAt(s+3) === 10) breaks += 1; }
+      else if (b === 13) { if (text.charCodeAt(s+3) === 13) { hasCR = true; if (!(buf[s+3+1] === 10 && text.charCodeAt(s+3+1) === 10)) breaks += 1; } }
+    }
+          s += 4;
+        }
+        if (!qhit) {
+    while (s < n) {
+      b = buf[s];
+      if (b === 34) {
+        if (text.charCodeAt(s) === 34) {
+          if (buf[s+1] === 34 && text.charCodeAt(s+1) === 34) { seg = seg === null ? text.slice(segStart, s) + '"' : seg + text.slice(segStart, s) + '"'; s += 2; segStart = s; continue; }
+          close = s; qhit = true; break;
+        }
+      } else if (b < 14) {
+        if (b === 10) { if (text.charCodeAt(s) === 10) breaks += 1; }
+        else if (b === 13) { if (text.charCodeAt(s) === 13) { hasCR = true; if (!(buf[s+1] === 10 && text.charCodeAt(s+1) === 10)) breaks += 1; } }
+      }
+      s += 1;
+    }
         }
         if (close === -1) {
-          // The quote never closes: it is a literal character, and the text
-          // after it is read again as unquoted.
           pos = open + 1;
           line = openLine;
           errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          const r = scanUnquoted('"');
-          value = r.value;
-          ended = r.ended;
-          pos = r.next;
-          line += r.lineBump || 0;
+          const r = slowScan('"', pos, null, 0);
+          value = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
         } else {
           let qval;
-          if (seg === null) qval = text.slice(open + 1, close);
-          else {
-            seg.push(text.slice(segStart, close));
-            qval = seg.join('');
-          }
-          // Each CRLF or lone CR inside quotes is read as LF; count every
-          // line break the field held so the next record starts on its line.
-          if (qval.indexOf('\r') !== -1) qval = qval.replace(/\r\n?/g, '\n');
-          if (qval.indexOf('\n') !== -1) {
-            let k = 0;
-            let i = -1;
-            while ((i = qval.indexOf('\n', i + 1)) !== -1) k += 1;
-            line += k;
-          }
-          pos = close + 1;
-          if (pos >= n) {
-            value = qval;
-            ended = END;
+          if (seg === null) {
+            qval = text.slice(open + 1, close);
           } else {
-            const c = text.charCodeAt(pos);
-            if (c === 44) {
-              pos += 1;
-              value = qval;
-              ended = COMMA;
-            } else if (c === 10) {
-              pos += 1;
-              line += 1;
-              value = qval;
-              ended = LINE_BREAK;
-            } else if (c === 13 && text.charCodeAt(pos + 1) === 10) {
-              pos += 2;
-              line += 1;
-              value = qval;
-              ended = LINE_BREAK;
-            } else {
-              // What follows the closing quote is appended as it stands, up to
-              // the next comma or line break.
-              const r = scanUnquoted(qval);
-              value = r.value;
-              ended = r.ended;
-              pos = r.next;
-              line += r.lineBump || 0;
+            qval = seg + text.slice(segStart, close);
+          }
+          if (hasCR) qval = qval.replace(/\r\n?/g, '\n');
+          line += breaks;
+          pos = close + 1;
+          if (pos >= n) { value = qval; ended = END; }
+          else {
+            const cb = buf[pos];
+            if (cb === 44 && text.charCodeAt(pos) === 44) { pos += 1; value = qval; ended = COMMA; }
+            else if (cb === 10 && text.charCodeAt(pos) === 10) { pos += 1; line += 1; value = qval; ended = LINE_BREAK; }
+            else if (cb === 13 && text.charCodeAt(pos) === 13 && buf[pos + 1] === 10 && text.charCodeAt(pos + 1) === 10) { pos += 2; line += 1; value = qval; ended = LINE_BREAK; }
+            else {
+              const r = slowScan(qval, pos, null, 0);
+              value = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
               if (r.added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
             }
           }
         }
       } else {
-        // An unquoted field.
+        // ---- FAST: plain unquoted field. 4-lane latin1 byte scan + one slice.
         quoted = false;
-        const r = scanUnquoted(null);
-        value = r.value;
-        ended = r.ended;
-        pos = r.next;
-        line += r.lineBump || 0;
+        let j = pos;
+        let c = 0;
+        let hit = false;
+        while (j + 3 < n) {
+    b = buf[j];
+    if (b < 14) { if (b === 10 || b === 13) { if (text.charCodeAt(j) === b) { c = b; j += 0; hit = true; break; } } }
+    else if (b === 44) { if (text.charCodeAt(j) === 44) { c = 44; j += 0; hit = true; break; } }
+    b = buf[j+1];
+    if (b < 14) { if (b === 10 || b === 13) { if (text.charCodeAt(j+1) === b) { c = b; j += 1; hit = true; break; } } }
+    else if (b === 44) { if (text.charCodeAt(j+1) === 44) { c = 44; j += 1; hit = true; break; } }
+    b = buf[j+2];
+    if (b < 14) { if (b === 10 || b === 13) { if (text.charCodeAt(j+2) === b) { c = b; j += 2; hit = true; break; } } }
+    else if (b === 44) { if (text.charCodeAt(j+2) === 44) { c = 44; j += 2; hit = true; break; } }
+    b = buf[j+3];
+    if (b < 14) { if (b === 10 || b === 13) { if (text.charCodeAt(j+3) === b) { c = b; j += 3; hit = true; break; } } }
+    else if (b === 44) { if (text.charCodeAt(j+3) === 44) { c = 44; j += 3; hit = true; break; } }
+          j += 4;
+        }
+        if (!hit) {
+    while (j < n) {
+      b = buf[j];
+      if (b < 14) { if (b === 10 || b === 13) { if (text.charCodeAt(j) === b) { c = b; hit = true; break; } } }
+      else if (b === 44) { if (text.charCodeAt(j) === 44) { c = 44; hit = true; break; } }
+      j += 1;
+    }
+        }
+        if (j >= n) { value = text.slice(pos, j); ended = END; pos = n; }
+        else if (c === 44) { value = text.slice(pos, j); ended = COMMA; pos = j + 1; }
+        else if (c === 10) { value = text.slice(pos, j); ended = LINE_BREAK; pos = j + 1; line += 1; }
+        else if (buf[j + 1] === 10 && text.charCodeAt(j + 1) === 10) { value = text.slice(pos, j); ended = LINE_BREAK; pos = j + 2; line += 1; }
+        else {
+          // Stray CR at j: slow scan from j+1, first segment already kept.
+          errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+          const r = slowScan(null, j + 1, [text.slice(pos, j)], j - pos);
+          value = r.value; ended = r.ended; pos = r.next; line += r.lineBump;
+        }
       }
-      fields.push(value);
+      fields[fi++] = value;
     } while (ended === COMMA);
+    if (fi !== width) fields.length = fi;
 
-    // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
     if (fields.length === 1 && fields[0] === '' && !quoted) continue;
 
     if (width < 0) width = fields.length;
-    if (header && columns === null) {
-      columns = fields;
-      continue;
-    }
+    if (header && columns === null) { columns = fields; continue; }
     if (fields.length < width) {
       errors.push({ code: 'short_row', line: recordLine, row: recordRow, fields: fields.length });
-      while (fields.length < width) fields.push('');
+      while (fi < width) fields[fi++] = '';
+      fields.length = fi;
     } else if (fields.length > width) {
       errors.push({ code: 'long_row', line: recordLine, row: recordRow, extra: fields.splice(width) });
     }
