@@ -1,10 +1,13 @@
-// v18 (from v17): feedback-complete warmup — the warmup spans now execute
-// every TurboFan eager-deopt site before the first compile (blank lines,
-// lone CR, quoted LF/CR/CRLF, quote junk, unterminated, stray CR, short/long
-// rows incl. multi-span and vStr cut fields, header=false), front-loaded
-// before the repetition loops. parseCase TurboFan compiles 7 -> 4, bailouts
-// 8 -> 2; whole-program rig v18/v17 ~0.844 pooled (-15.6%). solve.js
-// unchanged (v11). See V18-REPORT.md.
+// v19 (from v18): kill the last two TurboFan eager deopts + cheaper warmup.
+//   * Grow-proof output buffer: initial size span + span>>2 (25% headroom)
+//     instead of span + 131072. Practice-set output exceeds span by at most
+//     12.4%, so real cases NEVER grow now; the @1940 grow-check deopt is gone.
+//   * BOM warmup span (raw EF BB BF prefix) kills the @81 BOM-check deopt.
+//   * Warmup loops 100x -> 30x per span (feedback is already complete, so the
+//     extra 70x only burned compile-contended CPU).
+//   Trace (fresh process): parseCase compiles 4 -> 2 (1 OSR + 1 full),
+//   bailouts 2 -> 0; whole-program rig v19/v18 ~0.85 pooled (-15%).
+//   solve.js unchanged (v11, byte-identical). See V19-REPORT.md.
 // csv-reader-speed v16 — byte-level JSON-to-JSON CSV transducer.
 //
 // Architecture (fundamentally different from v5–v15, which all optimized
@@ -222,7 +225,7 @@ function scanQuoted(raw, n, start) {
 
 function parseCase(raw, s0, e, header) {
   const n = e;
-  let ob = Buffer.allocUnsafe(Math.max(1024, (e - s0) + 131072));
+  let ob = Buffer.allocUnsafe(Math.max(1024, (e - s0) + ((e - s0) >> 2)));
   let ol = 0;
   let pos = s0;
   let line = 1;
@@ -416,18 +419,22 @@ async function transduceAll(raw) {
     const wu = Buffer.from("x,\\\"a\\rb\\r\\nc,d\\ne,f\\n", 'ascii');
     const we = Buffer.from("a,\\\"bc", 'ascii');
     const wd = Buffer.from("a,b", 'ascii');
+    const wbom = Buffer.from([0xEF, 0xBB, 0xBF, ...Buffer.from("a,b\\n1,2\\n", 'ascii')]);
+
     const wb = Buffer.from(w.toString('ascii').repeat(500), 'ascii');
     parseCase(w, 0, w.length, true);
     parseCase(w, 0, w.length, false);
     parseCase(wu, 0, wu.length, true);
     parseCase(we, 0, we.length, true);
     parseCase(wd, 0, wd.length, true);
+    parseCase(wbom, 0, wbom.length, true);
     parseCase(wb, 0, wb.length, true);
-    for (let i = 0; i < 100; i++) parseCase(w, 0, w.length, true);
-    for (let i = 0; i < 100; i++) parseCase(w, 0, w.length, false);
-    for (let i = 0; i < 100; i++) parseCase(wu, 0, wu.length, true);
-    for (let i = 0; i < 100; i++) parseCase(we, 0, we.length, true);
-    for (let i = 0; i < 100; i++) parseCase(wd, 0, wd.length, true);
+    for (let i = 0; i < 30; i++) parseCase(w, 0, w.length, true);
+    for (let i = 0; i < 30; i++) parseCase(w, 0, w.length, false);
+    for (let i = 0; i < 30; i++) parseCase(wu, 0, wu.length, true);
+    for (let i = 0; i < 30; i++) parseCase(we, 0, we.length, true);
+    for (let i = 0; i < 30; i++) parseCase(wd, 0, wd.length, true);
+    for (let i = 0; i < 30; i++) parseCase(wbom, 0, wbom.length, true);
   }
   let p = 0;
   while (p < raw.length && isWs(raw[p])) p++;
