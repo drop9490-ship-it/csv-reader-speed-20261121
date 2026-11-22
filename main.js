@@ -1,3 +1,7 @@
+// v33 (from v28): INLINE scanUnquoted into parseCase (byte loop, no
+// SWAR) — kills the per-field call + shared UQ object stores. v24
+// inlined the quoted path only; this is the same treatment for the
+// unquoted path, which is ~86% of fields.
 // v28 (from v24): PRIME 1000x — 1000 mixed-span prime calls still trigger
 // the full TurboFan compile in warmup (trace: parseCase compiles), while
 // 750x/500x fall off a cliff (+22%: marking lands too late / OSR at case 0).
@@ -116,30 +120,6 @@ function materializeSpans(raw, spans, lits) {
 // escape starting with raw byte 92 (34 quote, 110 LF, 114 CR, others
 // ordinary). Field values are emitted as raw spans (verbatim JSON) unless
 // a slow path materializes them as JS strings.
-
-const UQ = { j: 0, c: 0, hit: false };
-function scanUnquoted(raw, n, start) {
-  let j = start;
-  let b = 0;
-  let t = 0;
-  let c = 0;
-  let hit = false;
-  while (j < n) {
-    b = raw[j];
-    if (b === 44) { c = 44; hit = true; break; }
-    else if (b === 92) {
-      t = raw[j + 1];
-      if (t === 34 || t === 116 || t === 98 || t === 102 || t === 47 || t === 92) { j = j + 2; continue; }
-      if (t === 117) throw NEED_FALLBACK;
-      if (t === 110) { c = 10; hit = true; break; }
-      if (t === 114) { c = 13; hit = true; break; }
-      throw NEED_FALLBACK;
-    }
-    j += 1;
-  }
-  UQ.j = j; UQ.c = c; UQ.hit = hit;
-}
-
 
 function parseCase(raw, s0, e, header) {
   const n = e;
@@ -265,11 +245,28 @@ function parseCase(raw, s0, e, header) {
 
       } else {
         // ---- FAST: plain unquoted field. 1-lane raw scan + one span copy.
+        // v33: scanUnquoted INLINED (was a call + shared UQ object).
         quoted = false;
-        scanUnquoted(raw, n, pos);
-        let j = UQ.j;
-        let c = UQ.c;
-        let hit = UQ.hit;
+        let j = pos;
+        let c = 0;
+        let hit = false;
+        {
+          let _b = 0;
+          let _t = 0;
+          while (j < n) {
+            _b = raw[j];
+            if (_b === 44) { c = 44; hit = true; break; }
+            else if (_b === 92) {
+              _t = raw[j + 1];
+              if (_t === 34 || _t === 116 || _t === 98 || _t === 102 || _t === 47 || _t === 92) { j = j + 2; continue; }
+              if (_t === 117) throw NEED_FALLBACK;
+              if (_t === 110) { c = 10; hit = true; break; }
+              if (_t === 114) { c = 13; hit = true; break; }
+              throw NEED_FALLBACK;
+            }
+            j += 1;
+          }
+        }
         if (j >= n) { vA = pos; vB = j; vSpanBytes = j - pos; ended = END; pos = n; }
         else if (c === 44) { vA = pos; vB = j; vSpanBytes = j - pos; ended = COMMA; pos = j + 1; }
         else if (c === 10) { vA = pos; vB = j; vSpanBytes = j - pos; ended = LINE_BREAK; pos = j + 2; line += 1; }
