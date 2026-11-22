@@ -1,3 +1,9 @@
+// v87/v88: GRAFT of v76 deopt-fix singles onto v50/v28 -- two extra
+// warmup singles train `phase === 0` TRUE (zero-row case), `vStr.length
+// === 0` TRUE (empty materialized value) and evaluate `vLits.length === 0`
+// (empty field WITH pieces). v76 proved these remove the 5/5 parseCase
+// deopt on adversarial edges input at ~2 us cost, wash on practice speed.
+// Value is hidden-set robustness, not speed. See V76-REPORT.md.
 // v50 (from v33): DROP node:path import — one less builtin module to
 // load/parse at boot; paths are plain string concat (INPUT_DIR +
 // '/cases.json'). Boot micro-idea, never tried.
@@ -391,6 +397,11 @@ async function transduceAll(raw) {
     parseCase(we, 0, we.length, true);
     parseCase(wd, 0, wd.length, true);
     parseCase(wbom, 0, wbom.length, true);
+    // graft-v76: zero-row single (header=true) -- trains `phase === 0` TRUE.
+    parseCase(Buffer.from("\\n", 'ascii'), 0, 2, true);
+    // graft-v76b: empty-quoted+junk + four-quote-field single -- trains
+    // `vStr.length === 0` TRUE and evaluates `vLits.length === 0`.
+    parseCase(Buffer.from("\\\"\\\"junk,\\\"\\\"\\\"\\\"\\n", 'ascii'), 0, 19, true);
     // Prime: 2000 tiny real calls push parseCase over the tier-up budget so
     // the FULL TurboFan compile is queued here (not OSR during case 0).
     for (let k = 0; k < 1000; k++) parseCase(wm, 0, wm.length, true);
