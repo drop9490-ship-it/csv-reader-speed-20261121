@@ -1,3 +1,6 @@
+// v50 (from v33): DROP node:path import — one less builtin module to
+// load/parse at boot; paths are plain string concat (INPUT_DIR +
+// '/cases.json'). Boot micro-idea, never tried.
 // v33 (from v28): INLINE scanUnquoted into parseCase (byte loop, no
 // SWAR) — kills the per-field call + shared UQ object stores. v24
 // inlined the quoted path only; this is the same treatment for the
@@ -26,7 +29,6 @@
 // 21KB; .ts-fixed cost ~0.095s remains). Transducer v16: byte-level JSON-to-JSON,
 // no JSON.parse/stringify, run() kept as entry + fallback. See V16-REPORT.md.
 import { readFileSync, openSync, writeSync, closeSync } from 'node:fs';
-import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
 // V8's incremental marking off, set before solve.js is imported so all of
@@ -443,7 +445,7 @@ async function transduceAll(raw) {
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const raw = readFileSync(join(INPUT_DIR, 'cases.json'));
+const raw = readFileSync(INPUT_DIR + '/cases.json');
 let outBuf;
 try {
   outBuf = await transduceAll(raw);
@@ -452,7 +454,7 @@ try {
   else throw err;
 }
 {
-  const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
+  const fd = openSync(OUTPUT_DIR + '/answers.json', 'w');
   const chunks = Buffer.isBuffer(outBuf) ? [outBuf] : outBuf;
   for (const part of chunks) writeSync(fd, part);
   closeSync(fd);
