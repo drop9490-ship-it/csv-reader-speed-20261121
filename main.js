@@ -1,3 +1,9 @@
+// v93 (from v77): GRAFT of v76 deopt-fix singles (see v87) onto the v77
+// cold-escape extraction -- combines the two nominal-best orthogonal
+// changes (v77: smallest hot compile unit; v76: 0 deopt on edges).
+// v77 (from v50): COLD-PATH EXTRACTION -- the vStr escape-encode loop
+// (slow-path materialized values only) moves out of parseCase into its
+// own function, so the hot compile unit no longer carries it.
 // v50 (from v33): DROP node:path import — one less builtin module to
 // load/parse at boot; paths are plain string concat (INPUT_DIR +
 // '/cases.json'). Boot micro-idea, never tried.
@@ -122,6 +128,27 @@ function materializeSpans(raw, spans, lits) {
 // escape starting with raw byte 92 (34 quote, 110 LF, 114 CR, others
 // ordinary). Field values are emitted as raw spans (verbatim JSON) unless
 // a slow path materializes them as JS strings.
+
+// v77: cold escape-encode + write for slow-path materialized values.
+// Separate compile unit (not inlined: --no-turbo-inlining). Caller already
+// reserved `vStr.length * 6 + 16` bytes via `need` + growBuf.
+function writeEscaped(ob, ol, vStr) {
+  let s = '"';
+  for (let i = 0; i < vStr.length; i++) {
+    const c = vStr.charCodeAt(i);
+    if (c === 34) s += '\\"';
+    else if (c === 92) s += '\\\\';
+    else if (c === 10) s += '\\n';
+    else if (c === 13) s += '\\r';
+    else if (c === 9) s += '\\t';
+    else if (c === 8) s += '\\b';
+    else if (c === 12) s += '\\f';
+    else if (c < 32) s += '\\u' + c.toString(16).padStart(4, '0');
+    else s += vStr[i];
+  }
+  s += '"';
+  return ol + ob.write(s, ol, 'utf8');
+}
 
 function parseCase(raw, s0, e, header) {
   const n = e;
@@ -290,23 +317,7 @@ function parseCase(raw, s0, e, header) {
         const need = 1 + 2 + vSpanBytes + (vLits === null ? 0 : vLits.length) + (vStr !== null ? vStr.length * 6 + 16 : 0);
         if (ol + need > ob.length) ob = growBuf(ob, ol, ol + need);
         if (fi > 0) ob[ol++] = 44;
-        if (vStr !== null) {
-          let s = '"';
-          for (let i = 0; i < vStr.length; i++) {
-            const c = vStr.charCodeAt(i);
-            if (c === 34) s += '\\"';
-            else if (c === 92) s += '\\\\';
-            else if (c === 10) s += '\\n';
-            else if (c === 13) s += '\\r';
-            else if (c === 9) s += '\\t';
-            else if (c === 8) s += '\\b';
-            else if (c === 12) s += '\\f';
-            else if (c < 32) s += '\\u' + c.toString(16).padStart(4, '0');
-            else s += vStr[i];
-          }
-          s += '"';
-          ol += ob.write(s, ol, 'utf8');
-        }
+        if (vStr !== null) ol = writeEscaped(ob, ol, vStr);
         else if (vPieces === null) {
           ob[ol++] = 34;
           if (vB > vA) { raw.copy(ob, ol, vA, vB); ol += vB - vA; }
@@ -391,6 +402,10 @@ async function transduceAll(raw) {
     parseCase(we, 0, we.length, true);
     parseCase(wd, 0, wd.length, true);
     parseCase(wbom, 0, wbom.length, true);
+    // graft-v76: zero-row single -- trains `phase === 0` TRUE.
+    parseCase(Buffer.from("\\n", 'ascii'), 0, 2, true);
+    // graft-v76b: trains `vStr.length === 0` TRUE, evaluates `vLits.length === 0`.
+    parseCase(Buffer.from("\\\"\\\"junk,\\\"\\\"\\\"\\\"\\n", 'ascii'), 0, 19, true);
     // Prime: 2000 tiny real calls push parseCase over the tier-up budget so
     // the FULL TurboFan compile is queued here (not OSR during case 0).
     for (let k = 0; k < 1000; k++) parseCase(wm, 0, wm.length, true);
